@@ -57,6 +57,10 @@ virtual_brain/
   setup.sh                # One-command setup script
 ```
 
+## General Setup
+
+python3 -m venv .virtual-brain-env && source .virtual-brain-env/bin/activate && pip install -r requirements.txt
+
 ## Setup on Raspberry Pi
 
 ### Prerequisites

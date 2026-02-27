@@ -1,34 +1,30 @@
-"""
-Virtual Brain -- entry point.
-Run: python main.py
-"""
+"""Quick one-shot trigger for send_daily_tasks (no schedule)."""
 
+import asyncio
 import logging
-from datetime import datetime, time
-from pathlib import Path
-from zoneinfo import ZoneInfo
-from logging.handlers import TimedRotatingFileHandler
 
-from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
-from config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, TIMEZONE
-from bot import handle_message, handle_voice, send_daily_tasks
+from telegram.ext import ApplicationBuilder
+
+from config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
+from bot import send_daily_tasks
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+for _noisy in ("httpx", "telegram.ext", "apscheduler"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-if __name__ == "__main__":
+async def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
+    await app.initialize()
+    await app.start()
 
-    # ---- Proactive daily tasks summary at 08:00 (Europe/Madrid) ----
-    if TELEGRAM_CHAT_ID:
-        tz = ZoneInfo(TIMEZONE)
-        send_daily_tasks()
-    else:
-        logging.warning("TELEGRAM_CHAT_ID no configurado: el resumen diario de tareas está desactivado.")
+    app.job_queue.run_once(send_daily_tasks, when=0, data=TELEGRAM_CHAT_ID, name="test_daily_tasks")
+    await asyncio.sleep(5)
 
-    logging.info("Virtual Brain conectado a MeisterTask...")
-    app.run_polling()
+    await app.stop()
+    await app.shutdown()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

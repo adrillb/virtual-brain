@@ -274,9 +274,9 @@ async def send_daily_tasks(context: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append("")
         
     if health_tasks:
-        lines.append(f"Health ({day_name})")
+        lines.append(f"🏃🏼‍➡️🥗 ({day_name})")
         for t in health_tasks:
-            lines.append(f"  - {t['name']}")
+            lines.append(f"  • {t['name']}")
 
     message = "\n".join(lines).rstrip()
     logger.info("[DailyTasks] Enviando %d tarea(s) a chat=%s", len(tasks) + len(health_tasks), chat_id)
