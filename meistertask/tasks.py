@@ -2,6 +2,7 @@
 
 import json
 from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -189,7 +190,7 @@ def get_health_day_tasks(timezone="Europe/Madrid") -> list[dict]:
             return []
 
         health_project = next(
-            (p for p in projects_resp.json() if p.get("name", "").strip().lower() == "health"),
+            (p for p in projects_resp.json() if "health" in p.get("name", "").strip().lower()),
             None,
         )
         if not health_project:
@@ -218,17 +219,25 @@ def get_health_day_tasks(timezone="Europe/Madrid") -> list[dict]:
         )
         if section_tasks_resp.status_code != 200:
             return []
+        response = []
+        for t in section_tasks_resp.json():
+            if t.get("name", "") != "➖➖➖➖➖➖➖➖" and not t.get("due"):
+                response.append(
+                    {
+                        "id": t["id"],
+                        "name": t["name"],
+                        "notes": t.get("notes", ""),
+                        "section_name": day_section.get("name", day_name),
+                    }
+                )
 
-        return [
-            {
-                "id": t["id"],
-                "name": t["name"],
-                "notes": t.get("notes", ""),
-                "section_name": day_section.get("name", day_name),
-            }
-            for t in section_tasks_resp.json()
-        ]
-    except Exception:
+        return response
+    except Exception as e:
+        print(f"Error fetching health day tasks: {e}")
+        return []
+                
+    except Exception as e:
+        print(f"Error fetching health day tasks: {e}")
         return []
 
 # ---------------------------------------------------------------------------
