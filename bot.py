@@ -1,14 +1,6 @@
-"""
-Telegram bot message handler.
+"""Telegram bot message handlers and daily summaries."""
 
-Key improvement over original: a multi-step tool loop.
-The LLM can chain multiple tool calls (e.g. get_projects -> get_sections -> create_task)
-until it produces a final text response.
-
-Supports both text and voice messages (voice is transcribed via OpenAI Whisper).
-
-Also includes the proactive daily-tasks callback (no LLM involved).
-"""
+from __future__ import annotations
 
 import json
 import logging
@@ -16,17 +8,25 @@ import tempfile
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo
 
+import requests
+from openai import OpenAI
 from telegram import Update
 from telegram.ext import ContextTypes
-from openai import OpenAI
 
-from config import OPENAI_API_KEY, OPENAI_MODEL, TIMEZONE
+from config import MT_BASE_URL, MT_HEADERS, OPENAI_API_KEY, OPENAI_MODEL, TIMEZONE
 from meistertask import TOOL_REGISTRY
-from meistertask.tasks import get_health_day_tasks, get_tasks_due_today
 from meistertask.projects import get_projects as _get_projects_json
-from tool_schemas import TOOLS
+from meistertask.tasks import get_health_day_tasks, get_tasks_due_today
+from users import (
+    get_tools_for_user,
+    get_user,
+    get_user_project_ids,
+    get_user_project_permissions,
+    is_write_tool,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -35,31 +35,50 @@ ai_client = OpenAI(api_key=OPENAI_API_KEY)
 SYSTEM_PROMPT_BASE = (
     "Eres Virtual Brain, un asistente que gestiona proyectos en MeisterTask. "
     "Tienes acceso a herramientas para listar proyectos, secciones, etiquetas, miembros, "
-    "crear/actualizar/completar/mover/asignar tareas, buscar tareas, gestionar comentarios y más. "
+    "crear/actualizar/completar/mover/asignar tareas, buscar tareas, gestionar comentarios y mas. "
     "Cuando el usuario pida algo, usa las herramientas necesarias paso a paso: "
-    "primero busca el proyecto, luego la sección, y después ejecuta la acción. "
-    "Cuando el usuario se refiera a la lista de la compra, busca en el proyecto 'Health' la sección 'Shopping Cart', la tarea '🛒' . Dentro se encuenta una checklist con los items de la lista de la compra."
-    "Siempre que crees una tarea con fecha debe ser asignada a Adri."
+    "primero busca el proyecto, luego la seccion, y despues ejecuta la accion. "
+    "Cuando el usuario se refiera a la lista de la compra, busca en el proyecto 'Health' "
+    "la seccion 'Shopping Cart', la tarea '🛒'. Dentro se encuentra una checklist con los items. "
+    "Siempre que crees una tarea con fecha debe ser asignada a Adri. "
     "Responde siempre en el idioma del usuario."
 )
 
+MAX_TOOL_ROUNDS = 10
 
-def _build_system_prompt() -> str:
-    """Build the system prompt with the current date and timezone injected."""
-    tz = ZoneInfo(TIMEZONE)
-    now = datetime.now(tz)
-    date_str = now.strftime("%Y-%m-%d (%A, %d de %B de %Y)")
-    time_str = now.strftime("%H:%M")
-    utc_offset = now.strftime("%z")  # e.g. "+0100" or "+0200"
-    utc_offset_fmt = f"{utc_offset[:3]}:{utc_offset[3:]}"  # e.g. "+01:00"
-    return (
-        f"{SYSTEM_PROMPT_BASE}\n"
-        f"La fecha y hora actual es: {date_str}, {time_str} (zona horaria: {TIMEZONE}, UTC{utc_offset_fmt}).\n"
-        f"IMPORTANTE: Cuando el usuario indique una hora, es hora local ({TIMEZONE}). "
-        f"Para el campo 'due' de las tareas, convierte siempre la hora local a UTC. "
-        f"Por ejemplo, si el usuario dice '21:00' y el offset actual es UTC{utc_offset_fmt}, "
-        f"debes enviar el campo due como 'YYYY-MM-DDT{_utc_example(21, utc_offset_fmt)}:00Z'."
-    )
+_SECTION_PROJECT_CACHE: dict[int, int] = {}
+_TASK_PROJECT_CACHE: dict[int, int] = {}
+_CHECKLIST_ITEM_TASK_CACHE: dict[int, int] = {}
+
+_SECTION_TOOLS = {"get_section_tasks", "create_task", "create_task_with_checklist"}
+_TASK_TOOLS = {
+    "get_task",
+    "get_task_comments",
+    "create_comment",
+    "get_task_checklist_items",
+    "create_checklist_item",
+    "complete_task",
+    "reopen_task",
+    "assign_task",
+    "set_task_due_date",
+    "trash_task",
+}
+
+
+def _safe_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_json_loads(value: Any) -> Any | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return None
 
 
 def _utc_example(local_hour: int, offset: str) -> str:
@@ -69,19 +88,281 @@ def _utc_example(local_hour: int, offset: str) -> str:
     utc_hour = (local_hour - sign * offset_hours) % 24
     return f"{utc_hour:02d}:00"
 
-MAX_TOOL_ROUNDS = 10
+
+def _build_project_map() -> dict[int, str]:
+    """Return a {project_id: project_name} mapping from MeisterTask."""
+    try:
+        data = json.loads(_get_projects_json())
+        if isinstance(data, list):
+            return {int(p["id"]): p["name"] for p in data}
+    except (json.JSONDecodeError, TypeError, KeyError, ValueError):
+        pass
+    return {}
 
 
-def _call_tool(name: str, args: dict) -> str:
-    """Dispatch a tool call to the matching MeisterTask function."""
+def _build_access_context(telegram_id: str) -> str:
+    permissions = get_user_project_permissions(telegram_id)
+    if not permissions:
+        return "No tienes acceso a ningun proyecto."
+
+    project_map = _build_project_map()
+    lines = ["Permisos del usuario actual en proyectos:"]
+
+    for project_id in sorted(permissions):
+        permission = permissions[project_id]
+        project_name = project_map.get(project_id, f"Proyecto {project_id}")
+        level = "lectura y escritura" if permission == "rw" else "solo lectura"
+        lines.append(f"- {project_name} (ID: {project_id}) -> {level}")
+
+    if not any(permission == "rw" for permission in permissions.values()):
+        lines.append("IMPORTANTE: este usuario no tiene permisos de escritura en ningun proyecto.")
+    lines.append("No accedas ni modifiques proyectos fuera de esta lista.")
+    return "\n".join(lines)
+
+
+def _build_system_prompt(telegram_id: str) -> str:
+    """Build the system prompt with date/time and user access context."""
+    tz = ZoneInfo(TIMEZONE)
+    now = datetime.now(tz)
+    date_str = now.strftime("%Y-%m-%d (%A, %d de %B de %Y)")
+    time_str = now.strftime("%H:%M")
+    utc_offset = now.strftime("%z")
+    utc_offset_fmt = f"{utc_offset[:3]}:{utc_offset[3:]}"
+    access_context = _build_access_context(telegram_id)
+    return (
+        f"{SYSTEM_PROMPT_BASE}\n"
+        f"{access_context}\n"
+        f"La fecha y hora actual es: {date_str}, {time_str} (zona horaria: {TIMEZONE}, UTC{utc_offset_fmt}).\n"
+        f"IMPORTANTE: Cuando el usuario indique una hora, es hora local ({TIMEZONE}). "
+        f"Para el campo 'due' de las tareas, convierte siempre la hora local a UTC. "
+        f"Por ejemplo, si el usuario dice '21:00' y el offset actual es UTC{utc_offset_fmt}, "
+        f"debes enviar el campo due como 'YYYY-MM-DDT{_utc_example(21, utc_offset_fmt)}:00Z'."
+    )
+
+
+def _resolve_section_project_id(section_id: int) -> int | None:
+    if section_id in _SECTION_PROJECT_CACHE:
+        return _SECTION_PROJECT_CACHE[section_id]
+
+    try:
+        resp = requests.get(f"{MT_BASE_URL}/sections/{section_id}", headers=MT_HEADERS, timeout=10)
+    except Exception as exc:
+        logger.error("Error resolving section_id=%s: %s", section_id, exc)
+        return None
+
+    if resp.status_code != 200:
+        return None
+
+    data = resp.json()
+    project_id = _safe_int(data.get("project_id"))
+    if project_id is None:
+        return None
+
+    _SECTION_PROJECT_CACHE[section_id] = project_id
+    return project_id
+
+
+def _resolve_task_project_id(task_id: int) -> int | None:
+    if task_id in _TASK_PROJECT_CACHE:
+        return _TASK_PROJECT_CACHE[task_id]
+
+    try:
+        resp = requests.get(f"{MT_BASE_URL}/tasks/{task_id}", headers=MT_HEADERS, timeout=10)
+    except Exception as exc:
+        logger.error("Error resolving task_id=%s: %s", task_id, exc)
+        return None
+
+    if resp.status_code != 200:
+        return None
+
+    data = resp.json()
+    project_id = _safe_int(data.get("project_id"))
+    if project_id is None:
+        return None
+
+    section_id = _safe_int(data.get("section_id"))
+    if section_id is not None:
+        _SECTION_PROJECT_CACHE[section_id] = project_id
+    _TASK_PROJECT_CACHE[task_id] = project_id
+    return project_id
+
+
+def _has_project_access(telegram_id: str, project_id: int, write: bool) -> bool:
+    permission = get_user_project_permissions(telegram_id).get(project_id)
+    if permission is None:
+        return False
+    if write and permission != "rw":
+        return False
+    return True
+
+
+def _validate_project_access(tool_name: str, telegram_id: str, project_id: int, write: bool) -> str | None:
+    if not _has_project_access(telegram_id, project_id, write):
+        action = "escritura" if write else "lectura"
+        return f"Error: no tienes permiso de {action} para el proyecto {project_id} ({tool_name})."
+    return None
+
+
+def _validate_tool_access(tool_name: str, args: dict[str, Any], telegram_id: str) -> str | None:
+    if not get_user(telegram_id):
+        return "Error: usuario no autorizado."
+
+    write = is_write_tool(tool_name)
+
+    if "project_id" in args and args.get("project_id") not in ("", None):
+        project_id = _safe_int(args.get("project_id"))
+        if project_id is None:
+            return "Error: project_id invalido."
+        return _validate_project_access(tool_name, telegram_id, project_id, write)
+
+    if tool_name in _SECTION_TOOLS:
+        section_id = _safe_int(args.get("section_id"))
+        if section_id is None:
+            return "Error: section_id invalido."
+        project_id = _resolve_section_project_id(section_id)
+        if project_id is None:
+            return f"Error: no se pudo resolver el proyecto de la seccion {section_id}."
+        return _validate_project_access(tool_name, telegram_id, project_id, write)
+
+    if tool_name == "move_task":
+        task_id = _safe_int(args.get("task_id"))
+        section_id = _safe_int(args.get("section_id"))
+        if task_id is None or section_id is None:
+            return "Error: task_id o section_id invalido."
+
+        source_project_id = _resolve_task_project_id(task_id)
+        destination_project_id = _resolve_section_project_id(section_id)
+        if source_project_id is None or destination_project_id is None:
+            return "Error: no se pudo validar acceso para mover la tarea."
+
+        err = _validate_project_access(tool_name, telegram_id, source_project_id, True)
+        if err:
+            return err
+        return _validate_project_access(tool_name, telegram_id, destination_project_id, True)
+
+    if tool_name == "update_task":
+        task_id = _safe_int(args.get("task_id"))
+        if task_id is None:
+            return "Error: task_id invalido."
+        task_project_id = _resolve_task_project_id(task_id)
+        if task_project_id is None:
+            return "Error: no se pudo resolver el proyecto de la tarea."
+
+        err = _validate_project_access(tool_name, telegram_id, task_project_id, True)
+        if err:
+            return err
+
+        destination_section = _safe_int(args.get("section_id"))
+        if destination_section:
+            destination_project_id = _resolve_section_project_id(destination_section)
+            if destination_project_id is None:
+                return "Error: no se pudo resolver el proyecto de la seccion destino."
+            return _validate_project_access(tool_name, telegram_id, destination_project_id, True)
+        return None
+
+    if tool_name in _TASK_TOOLS:
+        task_id = _safe_int(args.get("task_id"))
+        if task_id is None:
+            return "Error: task_id invalido."
+        project_id = _resolve_task_project_id(task_id)
+        if project_id is None:
+            return "Error: no se pudo resolver el proyecto de la tarea."
+        return _validate_project_access(tool_name, telegram_id, project_id, write)
+
+    if tool_name in {"update_checklist_item", "delete_checklist_item"}:
+        checklist_item_id = _safe_int(args.get("checklist_item_id"))
+        if checklist_item_id is None:
+            return "Error: checklist_item_id invalido."
+        task_id = _CHECKLIST_ITEM_TASK_CACHE.get(checklist_item_id)
+        if task_id is None:
+            return (
+                "Error: no se puede validar permisos de ese checklist_item_id aun. "
+                "Primero consulta los items del checklist de la tarea."
+            )
+        project_id = _resolve_task_project_id(task_id)
+        if project_id is None:
+            return "Error: no se pudo resolver el proyecto de la tarea."
+        return _validate_project_access(tool_name, telegram_id, project_id, True)
+
+    return None
+
+
+def _remember_tool_entities(tool_name: str, args: dict[str, Any], result: str) -> None:
+    result_data = _safe_json_loads(result)
+
+    if tool_name in {"create_task", "create_task_with_checklist"} and isinstance(result_data, dict):
+        task_id = _safe_int(result_data.get("id"))
+        section_id = _safe_int(args.get("section_id"))
+        if task_id is not None and section_id is not None:
+            project_id = _resolve_section_project_id(section_id)
+            if project_id is not None:
+                _TASK_PROJECT_CACHE[task_id] = project_id
+
+    if tool_name == "get_task_checklist_items" and isinstance(result_data, list):
+        task_id = _safe_int(args.get("task_id"))
+        if task_id is not None:
+            for item in result_data:
+                if isinstance(item, dict):
+                    checklist_item_id = _safe_int(item.get("id"))
+                    if checklist_item_id is not None:
+                        _CHECKLIST_ITEM_TASK_CACHE[checklist_item_id] = task_id
+
+    if tool_name == "create_checklist_item" and isinstance(result_data, dict):
+        checklist_item_id = _safe_int(result_data.get("id"))
+        task_id = _safe_int(args.get("task_id"))
+        if checklist_item_id is not None and task_id is not None:
+            _CHECKLIST_ITEM_TASK_CACHE[checklist_item_id] = task_id
+
+
+def _filter_tool_result(tool_name: str, result: str, telegram_id: str) -> str:
+    allowed_projects = get_user_project_ids(telegram_id)
+    if not allowed_projects:
+        return result
+
+    data = _safe_json_loads(result)
+    if data is None:
+        return result
+
+    if tool_name == "get_projects" and isinstance(data, list):
+        filtered = [item for item in data if _safe_int(item.get("id")) in allowed_projects]
+        return json.dumps(filtered, ensure_ascii=False)
+
+    if tool_name == "get_sections" and isinstance(data, list):
+        filtered = [item for item in data if _safe_int(item.get("project_id")) in allowed_projects]
+        return json.dumps(filtered, ensure_ascii=False)
+
+    if tool_name in {"get_all_tasks", "get_my_tasks", "search_tasks"} and isinstance(data, list):
+        filtered = [item for item in data if _safe_int(item.get("project_id")) in allowed_projects]
+        return json.dumps(filtered, ensure_ascii=False)
+
+    if tool_name == "get_task" and isinstance(data, dict):
+        task_project_id = _safe_int(data.get("project_id"))
+        if task_project_id not in allowed_projects:
+            return "Error: no tienes permiso para leer esa tarea."
+
+    return result
+
+
+def _call_tool(name: str, args: dict[str, Any], telegram_id: str) -> str:
+    """Dispatch a validated tool call to the matching MeisterTask function."""
     func = TOOL_REGISTRY.get(name)
     if not func:
         return f"Error: herramienta '{name}' no encontrada."
+
+    access_error = _validate_tool_access(name, args, telegram_id)
+    if access_error:
+        return access_error
+
     try:
-        return func(**args)
-    except Exception as e:
-        logger.error("Tool %s failed: %s", name, e)
-        return f"Error ejecutando {name}: {e}"
+        result = func(**args)
+    except Exception as exc:
+        logger.error("Tool %s failed: %s", name, exc)
+        return f"Error ejecutando {name}: {exc}"
+
+    if isinstance(result, str):
+        _remember_tool_entities(name, args, result)
+        return _filter_tool_result(name, result, telegram_id)
+    return str(result)
 
 
 async def _transcribe_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -95,28 +376,40 @@ async def _transcribe_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await file.download_to_drive(tmp_path)
 
     try:
-        logger.info("[Audio] Transcribiendo archivo %s (%.1f KB)...",
-                     tmp_path.name, tmp_path.stat().st_size / 1024)
+        logger.info(
+            "[Audio] Transcribiendo archivo %s (%.1f KB)...",
+            tmp_path.name,
+            tmp_path.stat().st_size / 1024,
+        )
         with open(tmp_path, "rb") as audio_file:
             transcription = ai_client.audio.transcriptions.create(
                 model="whisper-1",
                 file=audio_file,
             )
         text = transcription.text.strip()
-        logger.info("[Audio] Transcripción: %s", text)
+        logger.info("[Audio] Transcripcion: %s", text)
         return text
     finally:
         tmp_path.unlink(missing_ok=True)
 
 
-async def _process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, user_text: str):
+async def _process_text(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_text: str,
+    telegram_id: str,
+) -> None:
     """Core logic: send user_text through the multi-step tool-calling loop."""
     chat_id = update.effective_chat.id
+    tools_for_user = get_tools_for_user(telegram_id)
+    if not tools_for_user:
+        await update.message.reply_text("No tienes permisos suficientes para usar este bot.")
+        return
 
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
-    system_prompt = _build_system_prompt()
-    logger.info("[SystemPrompt] %s", system_prompt)
+    system_prompt = _build_system_prompt(telegram_id)
+    logger.info("[SystemPrompt][user=%s] %s", telegram_id, system_prompt)
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -127,7 +420,7 @@ async def _process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, user
         response = ai_client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=messages,
-            tools=TOOLS,
+            tools=tools_for_user,
             tool_choice="auto",
         )
 
@@ -135,7 +428,7 @@ async def _process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, user
 
         if not assistant_msg.tool_calls:
             reply = assistant_msg.content or "(sin respuesta)"
-            logger.info("[Respuesta] chat=%s: %s", chat_id, reply)
+            logger.info("[Respuesta] chat=%s user=%s: %s", chat_id, telegram_id, reply)
             await update.message.reply_text(reply)
             return
 
@@ -144,12 +437,16 @@ async def _process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, user
         for tool_call in assistant_msg.tool_calls:
             fn_name = tool_call.function.name
             fn_args = json.loads(tool_call.function.arguments)
-            logger.info("[Acción] chat=%s tool=%s args=%s", chat_id, fn_name, fn_args)
+            logger.info("[Accion] chat=%s user=%s tool=%s args=%s", chat_id, telegram_id, fn_name, fn_args)
 
-            result = _call_tool(fn_name, fn_args)
-            logger.info("[Resultado] chat=%s tool=%s resultado=%s",
-                        chat_id, fn_name,
-                        result[:500] if isinstance(result, str) else result)
+            result = _call_tool(fn_name, fn_args, telegram_id)
+            logger.info(
+                "[Resultado] chat=%s user=%s tool=%s resultado=%s",
+                chat_id,
+                telegram_id,
+                fn_name,
+                result[:500] if isinstance(result, str) else result,
+            )
 
             messages.append({
                 "role": "tool",
@@ -159,9 +456,9 @@ async def _process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, user
 
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
-    logger.warning("[Límite] chat=%s: se alcanzó el máximo de rondas (%s)", chat_id, MAX_TOOL_ROUNDS)
+    logger.warning("[Limite] chat=%s user=%s: max rondas=%s", chat_id, telegram_id, MAX_TOOL_ROUNDS)
     await update.message.reply_text(
-        "Lo siento, la operación requirió demasiados pasos. Intenta ser más específico."
+        "Lo siento, la operacion requirio demasiados pasos. Intenta ser mas especifico."
     )
 
 
@@ -170,16 +467,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
     chat_id = update.effective_chat.id
     user = update.effective_user
+    telegram_id = str(user.id) if user else ""
 
     logger.info("[Pregunta] chat=%s user=%s: %s", chat_id, user.first_name if user else "?", user_text)
 
+    if not telegram_id or not get_user(telegram_id):
+        logger.warning("[Auth] Acceso denegado chat=%s user_id=%s", chat_id, telegram_id or "?")
+        await update.message.reply_text("No tienes acceso a este bot.")
+        return
+
     try:
-        await _process_text(update, context, user_text)
-    except Exception as e:
-        logger.error("[Error] chat=%s: %s", chat_id, e, exc_info=True)
+        await _process_text(update, context, user_text, telegram_id)
+    except Exception as exc:
+        logger.error("[Error] chat=%s: %s", chat_id, exc, exc_info=True)
         try:
             await update.message.reply_text(
-                f"⚠️ Ha ocurrido un error:\n{type(e).__name__}: {e}"
+                f"⚠️ Ha ocurrido un error:\n{type(exc).__name__}: {exc}"
             )
         except Exception:
             logger.error("No se pudo enviar el mensaje de error al chat %s", chat_id)
@@ -189,56 +492,77 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle an incoming Telegram voice or audio message."""
     chat_id = update.effective_chat.id
     user = update.effective_user
+    telegram_id = str(user.id) if user else ""
 
     logger.info("[Audio] chat=%s user=%s: mensaje de voz recibido", chat_id, user.first_name if user else "?")
+
+    if not telegram_id or not get_user(telegram_id):
+        logger.warning("[Auth] Acceso denegado chat=%s user_id=%s (voz)", chat_id, telegram_id or "?")
+        await update.message.reply_text("No tienes acceso a este bot.")
+        return
 
     try:
         user_text = await _transcribe_voice(update, context)
         if not user_text:
-            await update.message.reply_text("No he podido entender el audio. ¿Puedes repetirlo?")
+            await update.message.reply_text("No he podido entender el audio. Puedes repetirlo?")
             return
 
         logger.info("[Pregunta] chat=%s user=%s (voz): %s", chat_id, user.first_name if user else "?", user_text)
-        await _process_text(update, context, user_text)
-    except Exception as e:
-        logger.error("[Error] chat=%s: %s", chat_id, e, exc_info=True)
+        await _process_text(update, context, user_text, telegram_id)
+    except Exception as exc:
+        logger.error("[Error] chat=%s: %s", chat_id, exc, exc_info=True)
         try:
             await update.message.reply_text(
-                f"⚠️ Ha ocurrido un error:\n{type(e).__name__}: {e}"
+                f"⚠️ Ha ocurrido un error:\n{type(exc).__name__}: {exc}"
             )
         except Exception:
             logger.error("No se pudo enviar el mensaje de error al chat %s", chat_id)
 
 
-# ---------------------------------------------------------------------------
-# Proactive daily summary (no LLM -- pure data + formatting)
-# ---------------------------------------------------------------------------
-
-def _build_project_map() -> dict[int, str]:
-    """Return a {project_id: project_name} mapping from MeisterTask."""
-    try:
-        data = json.loads(_get_projects_json())
-        if isinstance(data, list):
-            return {p["id"]: p["name"] for p in data}
-    except (json.JSONDecodeError, TypeError, KeyError):
-        pass
-    return {}
-
-
 async def send_daily_tasks(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """JobQueue callback: send today's task summary.
+    """JobQueue callback: send today's task summary for one registered user."""
+    job_data = context.job.data
+    if isinstance(job_data, dict):
+        telegram_id = str(job_data.get("telegram_id", "")).strip()
+    else:
+        telegram_id = str(job_data).strip()
 
-    * Queries MeisterTask directly -- no LLM involved.
-    * Does nothing if there are no tasks due today.
-    * The target ``chat_id`` is passed via ``context.job.data``.
-    """
-    chat_id = context.job.data
-    logger.info("[DailyTasks] Comprobando tareas para hoy (chat=%s)...", chat_id)
+    if not telegram_id:
+        logger.warning("[DailyTasks] Job sin telegram_id.")
+        return
+
+    user = get_user(telegram_id)
+    if not user:
+        logger.warning("[DailyTasks] Usuario no registrado: %s", telegram_id)
+        return
+
+    daily_summary = user.get("daily_summary", {})
+    if not daily_summary.get("enabled", False):
+        logger.info("[DailyTasks] Resumen diario desactivado para user=%s", telegram_id)
+        return
+
+    allowed_projects = get_user_project_ids(telegram_id)
+    selected_projects = {_safe_int(p) for p in daily_summary.get("project_ids", [])}
+    selected_projects = {p for p in selected_projects if p is not None}
+    selected_projects &= allowed_projects
+    include_health = bool(daily_summary.get("include_health", False))
+
+    logger.info("[DailyTasks] Comprobando tareas para user=%s...", telegram_id)
 
     tasks = get_tasks_due_today()
-    health_tasks = get_health_day_tasks(TIMEZONE)
+    tasks = [t for t in tasks if _safe_int(t.get("project_id")) in selected_projects]
+
+    project_map = _build_project_map()
+    health_project_ids = {
+        project_id
+        for project_id, project_name in project_map.items()
+        if "health" in str(project_name).lower()
+    }
+    has_health_access = bool(allowed_projects & health_project_ids) or not health_project_ids
+    health_tasks = get_health_day_tasks(TIMEZONE) if include_health and has_health_access else []
+
     if not tasks and not health_tasks:
-        logger.info("[DailyTasks] No hay tareas programadas para hoy ni tareas de Health por dia.")
+        logger.info("[DailyTasks] Sin tareas para user=%s.", telegram_id)
         return
 
     tz = ZoneInfo(TIMEZONE)
@@ -248,36 +572,36 @@ async def send_daily_tasks(context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = [f"📋 Tareas para hoy ({today_str}):\n"]
 
     if tasks:
-        project_map = _build_project_map()
-        
-        # Sort tasks by time: those with a specific hour first (earliest to latest),
-        # then those with only a date (no time) at the end.
         tasks.sort(key=lambda t: (0, t["due"]) if "T" in t["due"] else (1, t["due"]))
+        by_project: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for task in tasks:
+            project_name = project_map.get(_safe_int(task.get("project_id")) or -1, "Sin proyecto")
+            by_project[project_name].append(task)
 
-        by_project: dict[str, list[dict]] = defaultdict(list)
-        for t in tasks:
-            project_name = project_map.get(t["project_id"], "Sin proyecto")
-            by_project[project_name].append(t)
+        for project_name in sorted(by_project):
+            lines.append(f"📁 {project_name}")
+            for task in by_project[project_name]:
+                due_time = ""
+                due = str(task.get("due", ""))
+                if "T" in due:
+                    try:
+                        dt = datetime.fromisoformat(due.replace("Z", "+00:00"))
+                        local_dt = dt.astimezone(tz)
+                        due_time = f" (⏰ {local_dt.strftime('%H:%M')})"
+                    except ValueError:
+                        pass
+                lines.append(f"  • {task['name']}{due_time}")
+            lines.append("")
 
-    for project_name in sorted(by_project):
-        lines.append(f"📁 {project_name}")
-        for t in by_project[project_name]:
-            due_time = ""
-            if "T" in t["due"]:
-                try:
-                    dt = datetime.fromisoformat(t["due"].replace("Z", "+00:00"))
-                    local_dt = dt.astimezone(tz)
-                    due_time = f" (⏰ {local_dt.strftime('%H:%M')})"
-                except ValueError:
-                    pass
-            lines.append(f"  • {t['name']}{due_time}")
-        lines.append("")
-        
     if health_tasks:
         lines.append(f"🏃🏼‍➡️🥗 ({day_name})")
-        for t in health_tasks:
-            lines.append(f"  • {t['name']}")
+        for task in health_tasks:
+            lines.append(f"  • {task['name']}")
 
     message = "\n".join(lines).rstrip()
-    logger.info("[DailyTasks] Enviando %d tarea(s) a chat=%s", len(tasks) + len(health_tasks), chat_id)
-    await context.bot.send_message(chat_id=chat_id, text=message)
+    logger.info(
+        "[DailyTasks] Enviando %d tarea(s) a user=%s",
+        len(tasks) + len(health_tasks),
+        telegram_id,
+    )
+    await context.bot.send_message(chat_id=int(telegram_id), text=message)

@@ -13,7 +13,7 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 # --- Telegram ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID=os.getenv("TELEGRAM_CHAT_ID", "")
+USERS_FILE = _HERE / "users.json"
 
 # --- Timezone ---
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Madrid")

@@ -11,8 +11,9 @@ from logging.handlers import TimedRotatingFileHandler
 
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
-from config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, TIMEZONE
+from config import TELEGRAM_TOKEN, TIMEZONE
 from bot import handle_message, handle_voice, send_daily_tasks
+from users import load_users
 
 # ---------------------------------------------------------------------------
 # Logging: console + daily rotated file in logs/
@@ -78,18 +79,31 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.add_error_handler(error_handler)
 
-    # ---- Proactive daily tasks summary at 08:00 (Europe/Madrid) ----
-    if TELEGRAM_CHAT_ID:
-        tz = ZoneInfo(TIMEZONE)
+    # ---- Proactive daily tasks summary (per user from users.json) ----
+    tz = ZoneInfo(TIMEZONE)
+    users = load_users().get("users", {})
+    scheduled_users = 0
+    for telegram_id, user_config in users.items():
+        daily_summary = user_config.get("daily_summary", {})
+        if not daily_summary.get("enabled", False):
+            continue
+
         app.job_queue.run_daily(
             send_daily_tasks,
             time=time(hour=18, minute=48, tzinfo=tz),
-            data=TELEGRAM_CHAT_ID,
-            name="daily_tasks_summary",
+            data={"telegram_id": str(telegram_id)},
+            name=f"daily_tasks_summary_{telegram_id}",
         )
-        logging.info("Resumen diario programado a las 06:30 (%s) para chat=%s", TIMEZONE, TELEGRAM_CHAT_ID)
+        scheduled_users += 1
+
+    if scheduled_users:
+        logging.info(
+            "Resumen diario programado a las 18:48 (%s) para %s usuario(s).",
+            TIMEZONE,
+            scheduled_users,
+        )
     else:
-        logging.warning("TELEGRAM_CHAT_ID no configurado: el resumen diario de tareas está desactivado.")
+        logging.warning("No hay usuarios con daily_summary.enabled=true en users.json.")
 
     logging.info("Virtual Brain conectado a MeisterTask...")
     app.run_polling()

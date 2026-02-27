@@ -1,0 +1,20 @@
+{
+  "users": {
+    "123456789": {
+      "name": "Adri",
+      "role": "admin",
+      "projects": {
+        "84001234": "rw",
+        "84005678": "ro"
+      },
+      "daily_summary": {
+        "enabled": true,
+        "project_ids": [
+          84001234,
+          84005678
+        ],
+        "include_health": true
+      }
+    }
+  }
+}
