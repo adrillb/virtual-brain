@@ -66,6 +66,36 @@ def _normalize_daily_summary(raw_daily: Any) -> dict[str, Any]:
     }
 
 
+def _normalize_allowed_sections(raw_allowed_sections: Any) -> dict[str, list[int]]:
+    allowed_sections: dict[str, list[int]] = {}
+    if not isinstance(raw_allowed_sections, dict):
+        return allowed_sections
+
+    for project_id, section_ids in raw_allowed_sections.items():
+        try:
+            project_key = str(int(project_id))
+        except (TypeError, ValueError):
+            continue
+
+        if not isinstance(section_ids, list):
+            continue
+
+        normalized: list[int] = []
+        seen: set[int] = set()
+        for section_id in section_ids:
+            try:
+                parsed_section_id = int(section_id)
+            except (TypeError, ValueError):
+                continue
+            if parsed_section_id in seen:
+                continue
+            seen.add(parsed_section_id)
+            normalized.append(parsed_section_id)
+
+        allowed_sections[project_key] = normalized
+    return allowed_sections
+
+
 def load_users() -> dict[str, Any]:
     """Load users from users.json with mtime-based cache invalidation."""
     global _users_cache, _users_mtime
@@ -99,11 +129,13 @@ def load_users() -> dict[str, Any]:
             role = str(user_data.get("role", "user")).strip().lower() or "user"
             projects = _normalize_projects(user_data.get("projects", {}))
             daily_summary = _normalize_daily_summary(user_data.get("daily_summary", {}))
+            allowed_sections = _normalize_allowed_sections(user_data.get("allowed_sections", {}))
             users[str(telegram_id)] = {
                 "name": user_name,
                 "role": role,
                 "projects": projects,
                 "daily_summary": daily_summary,
+                "allowed_sections": allowed_sections,
             }
 
     _users_cache = {"users": users}
@@ -140,6 +172,41 @@ def get_user_project_ids(telegram_id: str, permission: str | None = None) -> set
 
     permission = permission.lower().strip()
     return {project_id for project_id, value in permissions.items() if value == permission}
+
+
+def get_user_allowed_sections(telegram_id: str, project_id: int) -> set[int] | None:
+    """
+    Return allowed section IDs for a user in one project.
+
+    Returns None when the project has no section-level restriction configured.
+    """
+    user = get_user(telegram_id)
+    if not user:
+        return set()
+
+    allowed_sections = user.get("allowed_sections", {})
+    if not isinstance(allowed_sections, dict):
+        return None
+
+    try:
+        project_key = str(int(project_id))
+    except (TypeError, ValueError):
+        return set()
+
+    if project_key not in allowed_sections:
+        return None
+
+    section_ids = allowed_sections.get(project_key, [])
+    if not isinstance(section_ids, list):
+        return set()
+
+    normalized_sections: set[int] = set()
+    for section_id in section_ids:
+        try:
+            normalized_sections.add(int(section_id))
+        except (TypeError, ValueError):
+            continue
+    return normalized_sections
 
 
 def is_write_tool(tool_name: str) -> bool:

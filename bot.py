@@ -23,6 +23,7 @@ from meistertask.tasks import get_health_day_tasks, get_tasks_due_today
 from users import (
     get_tools_for_user,
     get_user,
+    get_user_allowed_sections,
     get_user_project_ids,
     get_user_project_permissions,
     is_write_tool,
@@ -48,6 +49,7 @@ MAX_TOOL_ROUNDS = 10
 
 _SECTION_PROJECT_CACHE: dict[int, int] = {}
 _TASK_PROJECT_CACHE: dict[int, int] = {}
+_TASK_SECTION_CACHE: dict[int, int] = {}
 _CHECKLIST_ITEM_TASK_CACHE: dict[int, int] = {}
 
 _SECTION_TOOLS = {"get_section_tasks", "create_task", "create_task_with_checklist"}
@@ -112,7 +114,19 @@ def _build_access_context(telegram_id: str) -> str:
         permission = permissions[project_id]
         project_name = project_map.get(project_id, f"Proyecto {project_id}")
         level = "lectura y escritura" if permission == "rw" else "solo lectura"
-        lines.append(f"- {project_name} (ID: {project_id}) -> {level}")
+        allowed_sections = get_user_allowed_sections(telegram_id, project_id)
+        if allowed_sections is None:
+            lines.append(f"- {project_name} (ID: {project_id}) -> {level}")
+            continue
+
+        if allowed_sections:
+            section_ids = ", ".join(str(section_id) for section_id in sorted(allowed_sections))
+            lines.append(
+                f"- {project_name} (ID: {project_id}) -> {level} "
+                f"(solo secciones: {section_ids})"
+            )
+        else:
+            lines.append(f"- {project_name} (ID: {project_id}) -> {level} (sin secciones permitidas)")
 
     if not any(permission == "rw" for permission in permissions.values()):
         lines.append("IMPORTANTE: este usuario no tiene permisos de escritura en ningun proyecto.")
@@ -163,7 +177,7 @@ def _resolve_section_project_id(section_id: int) -> int | None:
 
 
 def _resolve_task_project_id(task_id: int) -> int | None:
-    if task_id in _TASK_PROJECT_CACHE:
+    if task_id in _TASK_PROJECT_CACHE and task_id in _TASK_SECTION_CACHE:
         return _TASK_PROJECT_CACHE[task_id]
 
     try:
@@ -183,6 +197,7 @@ def _resolve_task_project_id(task_id: int) -> int | None:
     section_id = _safe_int(data.get("section_id"))
     if section_id is not None:
         _SECTION_PROJECT_CACHE[section_id] = project_id
+        _TASK_SECTION_CACHE[task_id] = section_id
     _TASK_PROJECT_CACHE[task_id] = project_id
     return project_id
 
@@ -196,10 +211,39 @@ def _has_project_access(telegram_id: str, project_id: int, write: bool) -> bool:
     return True
 
 
+def _has_section_access(telegram_id: str, project_id: int, section_id: int, write: bool) -> bool:
+    if not _has_project_access(telegram_id, project_id, write):
+        return False
+
+    allowed_sections = get_user_allowed_sections(telegram_id, project_id)
+    if allowed_sections is None:
+        return True
+    return section_id in allowed_sections
+
+
 def _validate_project_access(tool_name: str, telegram_id: str, project_id: int, write: bool) -> str | None:
     if not _has_project_access(telegram_id, project_id, write):
         action = "escritura" if write else "lectura"
         return f"Error: no tienes permiso de {action} para el proyecto {project_id} ({tool_name})."
+    return None
+
+
+def _validate_section_access(
+    tool_name: str,
+    telegram_id: str,
+    project_id: int,
+    section_id: int,
+    write: bool,
+) -> str | None:
+    if not _has_section_access(telegram_id, project_id, section_id, write):
+        if not _has_project_access(telegram_id, project_id, write):
+            action = "escritura" if write else "lectura"
+            return f"Error: no tienes permiso de {action} para el proyecto {project_id} ({tool_name})."
+        action = "escritura" if write else "lectura"
+        return (
+            f"Error: no tienes permiso de {action} para la seccion {section_id} "
+            f"del proyecto {project_id} ({tool_name})."
+        )
     return None
 
 
@@ -222,7 +266,7 @@ def _validate_tool_access(tool_name: str, args: dict[str, Any], telegram_id: str
         project_id = _resolve_section_project_id(section_id)
         if project_id is None:
             return f"Error: no se pudo resolver el proyecto de la seccion {section_id}."
-        return _validate_project_access(tool_name, telegram_id, project_id, write)
+        return _validate_section_access(tool_name, telegram_id, project_id, section_id, write)
 
     if tool_name == "move_task":
         task_id = _safe_int(args.get("task_id"))
@@ -234,11 +278,14 @@ def _validate_tool_access(tool_name: str, args: dict[str, Any], telegram_id: str
         destination_project_id = _resolve_section_project_id(section_id)
         if source_project_id is None or destination_project_id is None:
             return "Error: no se pudo validar acceso para mover la tarea."
+        source_section_id = _TASK_SECTION_CACHE.get(task_id)
+        if source_section_id is None:
+            return "Error: no se pudo resolver la seccion de la tarea origen."
 
-        err = _validate_project_access(tool_name, telegram_id, source_project_id, True)
+        err = _validate_section_access(tool_name, telegram_id, source_project_id, source_section_id, True)
         if err:
             return err
-        return _validate_project_access(tool_name, telegram_id, destination_project_id, True)
+        return _validate_section_access(tool_name, telegram_id, destination_project_id, section_id, True)
 
     if tool_name == "update_task":
         task_id = _safe_int(args.get("task_id"))
@@ -247,8 +294,11 @@ def _validate_tool_access(tool_name: str, args: dict[str, Any], telegram_id: str
         task_project_id = _resolve_task_project_id(task_id)
         if task_project_id is None:
             return "Error: no se pudo resolver el proyecto de la tarea."
+        task_section_id = _TASK_SECTION_CACHE.get(task_id)
+        if task_section_id is None:
+            return "Error: no se pudo resolver la seccion de la tarea."
 
-        err = _validate_project_access(tool_name, telegram_id, task_project_id, True)
+        err = _validate_section_access(tool_name, telegram_id, task_project_id, task_section_id, True)
         if err:
             return err
 
@@ -257,7 +307,13 @@ def _validate_tool_access(tool_name: str, args: dict[str, Any], telegram_id: str
             destination_project_id = _resolve_section_project_id(destination_section)
             if destination_project_id is None:
                 return "Error: no se pudo resolver el proyecto de la seccion destino."
-            return _validate_project_access(tool_name, telegram_id, destination_project_id, True)
+            return _validate_section_access(
+                tool_name,
+                telegram_id,
+                destination_project_id,
+                destination_section,
+                True,
+            )
         return None
 
     if tool_name in _TASK_TOOLS:
@@ -267,7 +323,10 @@ def _validate_tool_access(tool_name: str, args: dict[str, Any], telegram_id: str
         project_id = _resolve_task_project_id(task_id)
         if project_id is None:
             return "Error: no se pudo resolver el proyecto de la tarea."
-        return _validate_project_access(tool_name, telegram_id, project_id, write)
+        section_id = _TASK_SECTION_CACHE.get(task_id)
+        if section_id is None:
+            return "Error: no se pudo resolver la seccion de la tarea."
+        return _validate_section_access(tool_name, telegram_id, project_id, section_id, write)
 
     if tool_name in {"update_checklist_item", "delete_checklist_item"}:
         checklist_item_id = _safe_int(args.get("checklist_item_id"))
@@ -282,7 +341,10 @@ def _validate_tool_access(tool_name: str, args: dict[str, Any], telegram_id: str
         project_id = _resolve_task_project_id(task_id)
         if project_id is None:
             return "Error: no se pudo resolver el proyecto de la tarea."
-        return _validate_project_access(tool_name, telegram_id, project_id, True)
+        section_id = _TASK_SECTION_CACHE.get(task_id)
+        if section_id is None:
+            return "Error: no se pudo resolver la seccion de la tarea."
+        return _validate_section_access(tool_name, telegram_id, project_id, section_id, True)
 
     return None
 
@@ -297,6 +359,7 @@ def _remember_tool_entities(tool_name: str, args: dict[str, Any], result: str) -
             project_id = _resolve_section_project_id(section_id)
             if project_id is not None:
                 _TASK_PROJECT_CACHE[task_id] = project_id
+                _TASK_SECTION_CACHE[task_id] = section_id
 
     if tool_name == "get_task_checklist_items" and isinstance(result_data, list):
         task_id = _safe_int(args.get("task_id"))
@@ -323,21 +386,53 @@ def _filter_tool_result(tool_name: str, result: str, telegram_id: str) -> str:
     if data is None:
         return result
 
+    def _can_read_section(project_id: int | None, section_id: int | None) -> bool:
+        if project_id is None or project_id not in allowed_projects:
+            return False
+
+        restricted_sections = get_user_allowed_sections(telegram_id, project_id)
+        if restricted_sections is None:
+            return True
+        if section_id is None:
+            return False
+        return section_id in restricted_sections
+
     if tool_name == "get_projects" and isinstance(data, list):
         filtered = [item for item in data if _safe_int(item.get("id")) in allowed_projects]
         return json.dumps(filtered, ensure_ascii=False)
 
     if tool_name == "get_sections" and isinstance(data, list):
-        filtered = [item for item in data if _safe_int(item.get("project_id")) in allowed_projects]
+        filtered = [
+            item
+            for item in data
+            if _can_read_section(_safe_int(item.get("project_id")), _safe_int(item.get("id")))
+        ]
+        return json.dumps(filtered, ensure_ascii=False)
+
+    if tool_name == "get_project_sections" and isinstance(data, list):
+        filtered = [
+            item
+            for item in data
+            if _can_read_section(_safe_int(item.get("project_id")), _safe_int(item.get("id")))
+        ]
         return json.dumps(filtered, ensure_ascii=False)
 
     if tool_name in {"get_all_tasks", "get_my_tasks", "search_tasks"} and isinstance(data, list):
-        filtered = [item for item in data if _safe_int(item.get("project_id")) in allowed_projects]
+        filtered = [
+            item
+            for item in data
+            if _can_read_section(_safe_int(item.get("project_id")), _safe_int(item.get("section_id")))
+        ]
         return json.dumps(filtered, ensure_ascii=False)
 
     if tool_name == "get_task" and isinstance(data, dict):
         task_project_id = _safe_int(data.get("project_id"))
-        if task_project_id not in allowed_projects:
+        task_section_id = _safe_int(data.get("section_id"))
+        if task_section_id is None:
+            task_id = _safe_int(data.get("id"))
+            if task_id is not None:
+                task_section_id = _TASK_SECTION_CACHE.get(task_id)
+        if not _can_read_section(task_project_id, task_section_id):
             return "Error: no tienes permiso para leer esa tarea."
 
     return result
