@@ -1,0 +1,34 @@
+{
+  "users": {
+    "1765054267": {
+      "name": "Adri",
+      "role": "admin",
+      "projects": {
+        "5881914": "rw",
+        "8803892": "rw",
+        "5881991": "rw"
+      },
+      "daily_summary": {
+        "enabled": true,
+        "project_ids": [
+          5881914,
+          8803892,
+          5881991
+        ],
+        "include_health": true
+      }
+    },
+    "6428657712": {
+      "name": "Mery",
+      "role": "user",
+      "projects": {
+        "8803892": "rw"
+      },
+      "allowed_sections": {
+        "8803892": [
+          36963546
+        ]
+      }
+    }
+  }
+}
