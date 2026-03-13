@@ -21,6 +21,7 @@ from meistertask import TOOL_REGISTRY
 from meistertask.projects import get_projects as _get_projects_json
 from meistertask.tasks import get_health_day_tasks, get_tasks_due_today
 from users import (
+    get_all_member_mappings,
     get_tools_for_user,
     get_user,
     get_user_allowed_sections,
@@ -102,6 +103,25 @@ def _build_project_map() -> dict[int, str]:
     return {}
 
 
+def _build_member_mapping_context() -> str:
+    """Return configured Telegram user name -> MeisterTask member ID mapping."""
+    member_mappings = get_all_member_mappings()
+    if not member_mappings:
+        return ""
+
+    lines = [
+        "Mapeo de usuarios a IDs de miembro de MeisterTask "
+        "(para asignar tareas con assign_task o assigned_to_id):"
+    ]
+    for user_name in sorted(member_mappings):
+        lines.append(f"- {user_name} -> person_id: {member_mappings[user_name]}")
+    lines.append(
+        "Si el usuario pide asignar a uno de estos nombres, usa directamente ese person_id "
+        "sin llamar antes a get_project_members."
+    )
+    return "\n".join(lines)
+
+
 def _build_access_context(telegram_id: str) -> str:
     permissions = get_user_project_permissions(telegram_id)
     if not permissions:
@@ -143,9 +163,12 @@ def _build_system_prompt(telegram_id: str) -> str:
     utc_offset = now.strftime("%z")
     utc_offset_fmt = f"{utc_offset[:3]}:{utc_offset[3:]}"
     access_context = _build_access_context(telegram_id)
+    member_mapping_context = _build_member_mapping_context()
+    member_mapping_block = f"{member_mapping_context}\n" if member_mapping_context else ""
     return (
         f"{SYSTEM_PROMPT_BASE}\n"
         f"{access_context}\n"
+        f"{member_mapping_block}"
         f"La fecha y hora actual es: {date_str}, {time_str} (zona horaria: {TIMEZONE}, UTC{utc_offset_fmt}).\n"
         f"IMPORTANTE: Cuando el usuario indique una hora, es hora local ({TIMEZONE}). "
         f"Para el campo 'due' de las tareas, convierte siempre la hora local a UTC. "
@@ -377,7 +400,7 @@ def _remember_tool_entities(tool_name: str, args: dict[str, Any], result: str) -
             _CHECKLIST_ITEM_TASK_CACHE[checklist_item_id] = task_id
 
 
-def _filter_tool_result(tool_name: str, result: str, telegram_id: str) -> str:
+def _filter_tool_result(tool_name: str, result: str, telegram_id: str, args: dict[str, Any]) -> str:
     allowed_projects = get_user_project_ids(telegram_id)
     if not allowed_projects:
         return result
@@ -410,10 +433,14 @@ def _filter_tool_result(tool_name: str, result: str, telegram_id: str) -> str:
         return json.dumps(filtered, ensure_ascii=False)
 
     if tool_name == "get_project_sections" and isinstance(data, list):
+        requested_project_id = _safe_int(args.get("project_id"))
         filtered = [
             item
             for item in data
-            if _can_read_section(_safe_int(item.get("project_id")), _safe_int(item.get("id")))
+            if _can_read_section(
+                _safe_int(item.get("project_id")) or requested_project_id,
+                _safe_int(item.get("id")),
+            )
         ]
         return json.dumps(filtered, ensure_ascii=False)
 
@@ -456,7 +483,7 @@ def _call_tool(name: str, args: dict[str, Any], telegram_id: str) -> str:
 
     if isinstance(result, str):
         _remember_tool_entities(name, args, result)
-        return _filter_tool_result(name, result, telegram_id)
+        return _filter_tool_result(name, result, telegram_id, args)
     return str(result)
 
 

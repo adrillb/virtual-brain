@@ -28,7 +28,12 @@ def get_project_sections(project_id):
     )
     if resp.status_code == 200:
         return json.dumps([
-            {"id": s["id"], "name": s["name"], "color": s.get("color")}
+            {
+                "id": s["id"],
+                "name": s["name"],
+                "project_id": s.get("project_id", project_id),
+                "color": s.get("color"),
+            }
             for s in resp.json()
         ])
     return f"Error {resp.status_code}: {resp.text}"

@@ -96,6 +96,16 @@ def _normalize_allowed_sections(raw_allowed_sections: Any) -> dict[str, list[int
     return allowed_sections
 
 
+def _normalize_project_member_id(raw_project_member_id: Any) -> int | None:
+    try:
+        project_member_id = int(raw_project_member_id)
+    except (TypeError, ValueError):
+        return None
+    if project_member_id <= 0:
+        return None
+    return project_member_id
+
+
 def load_users() -> dict[str, Any]:
     """Load users from users.json with mtime-based cache invalidation."""
     global _users_cache, _users_mtime
@@ -130,12 +140,14 @@ def load_users() -> dict[str, Any]:
             projects = _normalize_projects(user_data.get("projects", {}))
             daily_summary = _normalize_daily_summary(user_data.get("daily_summary", {}))
             allowed_sections = _normalize_allowed_sections(user_data.get("allowed_sections", {}))
+            project_member_id = _normalize_project_member_id(user_data.get("project_member_id"))
             users[str(telegram_id)] = {
                 "name": user_name,
                 "role": role,
                 "projects": projects,
                 "daily_summary": daily_summary,
                 "allowed_sections": allowed_sections,
+                "project_member_id": project_member_id,
             }
 
     _users_cache = {"users": users}
@@ -207,6 +219,26 @@ def get_user_allowed_sections(telegram_id: str, project_id: int) -> set[int] | N
         except (TypeError, ValueError):
             continue
     return normalized_sections
+
+
+def get_all_member_mappings() -> dict[str, int]:
+    """Return `{user_name: project_member_id}` for configured users."""
+    users = load_users().get("users", {})
+    mappings: dict[str, int] = {}
+
+    if not isinstance(users, dict):
+        return mappings
+
+    for user_data in users.values():
+        if not isinstance(user_data, dict):
+            continue
+        user_name = str(user_data.get("name", "")).strip()
+        project_member_id = user_data.get("project_member_id")
+        if not user_name or not isinstance(project_member_id, int) or project_member_id <= 0:
+            continue
+        mappings[user_name] = project_member_id
+
+    return mappings
 
 
 def is_write_tool(tool_name: str) -> bool:
