@@ -90,7 +90,7 @@ if __name__ == "__main__":
 
         app.job_queue.run_daily(
             send_daily_tasks,
-            time=time(hour=18, minute=48, tzinfo=tz),
+            time=time(hour=6, minute=30, tzinfo=tz),
             data={"telegram_id": str(telegram_id)},
             name=f"daily_tasks_summary_{telegram_id}",
         )
@@ -98,7 +98,7 @@ if __name__ == "__main__":
 
     if scheduled_users:
         logging.info(
-            "Resumen diario programado a las 18:48 (%s) para %s usuario(s).",
+            "Resumen diario programado a las 6:30 (%s) para %s usuario(s).",
             TIMEZONE,
             scheduled_users,
         )
