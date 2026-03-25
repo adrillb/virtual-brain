@@ -161,6 +161,24 @@ def get_user(telegram_id: str) -> dict[str, Any] | None:
     return users.get(str(telegram_id))
 
 
+def get_admin_ids() -> set[str]:
+    """Return Telegram IDs configured with role 'admin'."""
+    users = load_users().get("users", {})
+    admin_ids: set[str] = set()
+
+    if not isinstance(users, dict):
+        return admin_ids
+
+    for telegram_id, user_data in users.items():
+        if not isinstance(user_data, dict):
+            continue
+        role = str(user_data.get("role", "user")).strip().lower()
+        if role == "admin":
+            admin_ids.add(str(telegram_id))
+
+    return admin_ids
+
+
 def get_user_project_permissions(telegram_id: str) -> dict[int, str]:
     """Return `{project_id: permission}` for the given Telegram user."""
     user = get_user(telegram_id)

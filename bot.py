@@ -21,6 +21,7 @@ from meistertask import TOOL_REGISTRY
 from meistertask.projects import get_projects as _get_projects_json
 from meistertask.tasks import get_health_day_tasks, get_tasks_due_today
 from users import (
+    get_admin_ids,
     get_all_member_mappings,
     get_tools_for_user,
     get_user,
@@ -520,13 +521,14 @@ async def _process_text(
     context: ContextTypes.DEFAULT_TYPE,
     user_text: str,
     telegram_id: str,
-) -> None:
+) -> str:
     """Core logic: send user_text through the multi-step tool-calling loop."""
     chat_id = update.effective_chat.id
     tools_for_user = get_tools_for_user(telegram_id)
     if not tools_for_user:
-        await update.message.reply_text("No tienes permisos suficientes para usar este bot.")
-        return
+        reply = "No tienes permisos suficientes para usar este bot."
+        await update.message.reply_text(reply)
+        return reply
 
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
@@ -552,7 +554,7 @@ async def _process_text(
             reply = assistant_msg.content or "(sin respuesta)"
             logger.info("[Respuesta] chat=%s user=%s: %s", chat_id, telegram_id, reply)
             await update.message.reply_text(reply)
-            return
+            return reply
 
         messages.append(assistant_msg)
 
@@ -579,9 +581,34 @@ async def _process_text(
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
     logger.warning("[Limite] chat=%s user=%s: max rondas=%s", chat_id, telegram_id, MAX_TOOL_ROUNDS)
-    await update.message.reply_text(
-        "Lo siento, la operacion requirio demasiados pasos. Intenta ser mas especifico."
+    reply = "Lo siento, la operacion requirio demasiados pasos. Intenta ser mas especifico."
+    await update.message.reply_text(reply)
+    return reply
+
+
+async def _notify_admins(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_name: str,
+    user_text: str,
+    bot_reply: str,
+) -> None:
+    """Notify admin users when a non-admin interacts with the bot."""
+    admin_ids = get_admin_ids()
+    if not admin_ids:
+        return
+
+    notification = (
+        "-- Notificacion --\n"
+        f"Usuario: {user_name}\n"
+        f"Pregunta: {user_text}\n"
+        f"Respuesta: {bot_reply}"
     )
+
+    for admin_id in admin_ids:
+        try:
+            await context.bot.send_message(chat_id=int(admin_id), text=notification)
+        except Exception as exc:
+            logger.error("No se pudo notificar al admin %s: %s", admin_id, exc)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -599,7 +626,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        await _process_text(update, context, user_text, telegram_id)
+        reply = await _process_text(update, context, user_text, telegram_id)
+        if telegram_id not in get_admin_ids():
+            display_name = user.full_name if user and user.full_name else (user.first_name if user else telegram_id)
+            await _notify_admins(context, display_name, user_text, reply)
     except Exception as exc:
         logger.error("[Error] chat=%s: %s", chat_id, exc, exc_info=True)
         try:
@@ -630,7 +660,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         logger.info("[Pregunta] chat=%s user=%s (voz): %s", chat_id, user.first_name if user else "?", user_text)
-        await _process_text(update, context, user_text, telegram_id)
+        reply = await _process_text(update, context, user_text, telegram_id)
+        if telegram_id not in get_admin_ids():
+            display_name = user.full_name if user and user.full_name else (user.first_name if user else telegram_id)
+            await _notify_admins(context, display_name, user_text, reply)
     except Exception as exc:
         logger.error("[Error] chat=%s: %s", chat_id, exc, exc_info=True)
         try:
